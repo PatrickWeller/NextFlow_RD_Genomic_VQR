@@ -14,6 +14,7 @@ log.info """\
     qsr truth vcfs  : ${params.qsrVcfs}
     output directory: ${params.outdir}
     fastqc          : ${params.fastqc}
+    readtrimming    : ${params.readtrimming}
     aligner         : ${params.aligner}
     variant caller  : ${params.variant_caller}
     bqsr            : ${params.bqsr}
@@ -30,12 +31,16 @@ if (params.index_genome) {
 if (params.fastqc) {
     include { FASTQC } from './modules/FASTQC'
 }
+if (params.readtrimming) {
+    include { readTrimming } from './modules/readTrimming'
+}
 include { sortBam } from './modules/sortBam'
 include { markDuplicates } from './modules/markDuplicates'
 include { indexBam } from './modules/indexBam'
 if (params.bqsr) {
     include { baseRecalibrator } from './modules/BQSR'
 }
+include { combineVCFs } from './modules/processGVCFs'
 include { combineGVCFs } from './modules/processGVCFs'
 include { genotypeGVCFs } from './modules/processGVCFs'
 if (params.variant_recalibration) {
@@ -50,13 +55,19 @@ if (params.aligner == 'bwa-mem') {
     include { alignReadsBwaMem } from './modules/alignReadsBwaMem'
 } else if (params.aligner == 'bwa-aln') {
     include { alignReadsBwaAln } from './modules/alignReadsBwaAln'
+} else if (params.aligner == 'minimap2') {
+    include { alignReadsMinimap2} from './modules/alignReadsMinimap2'
 } else {
-    error "Unsupported aligner: ${params.aligner}. Please specify 'bwa-mem' or 'bwa-aln'."
+    error "Unsupported aligner: ${params.aligner}. Please specify 'bwa-mem', 'bwa-aln', or 'minimap2'."
 }
 if (params.variant_caller == 'haplotype-caller') {
     include { haplotypeCaller } from './modules/haplotypeCaller'
+} else if (params.variant_caller == 'free-bayes') {
+    include { freeBayesCaller } from './modules/freeBayesCaller'
+} else if (params.variant_caller == 'bcftools-caller') {
+    include { bcftoolsCaller } from './modules/bcftoolsCaller'
 } else {
-    error "Unsupported variant caller: ${params.variant_caller}. Please specify 'haplotype-caller'."
+    error "Unsupported variant caller: ${params.variant_caller}. Please specify 'haplotype-caller' or 'free-bayes'."
 }
 
 if (params.degraded_dna) {
@@ -98,11 +109,22 @@ workflow {
         FASTQC(read_pairs_ch)
     }
 
+    //if (params.readtrimming) {
+    //   trim_reads_ch = readTrimming(read_pairs_ch)
+    //}
+    /* To Do:
+    Add the use of trim_reads_ch to the alignment, in the case where trimmed reads has been done)
+    I ran trimmed reads only with the command:
+    nextflow run main.nf -profile docker -entry READ_TRIM_only 
+    (Whilst readtrimming is true in the config) */
+
     // Align reads to the indexed genome
     if (params.aligner == 'bwa-mem') {
         align_ch = alignReadsBwaMem(read_pairs_ch, indexed_genome_ch.collect())
     } else if (params.aligner == 'bwa-aln') {
         align_ch = alignReadsBwaAln(read_pairs_ch, indexed_genome_ch.collect())
+    } else if (params.aligner == 'minimap2') {
+        align_ch = alignReadsMinimap2(read_pairs_ch, indexed_genome_ch.collect())
     }
 
     // Sort BAM files
@@ -142,6 +164,10 @@ workflow {
     // Run HaplotypeCaller on BQSR files
     if (params.variant_caller == "haplotype-caller") {
         gvcf_ch = haplotypeCaller(bqsr_ch, indexed_genome_ch.collect()).collect()
+    } else if (params.variant_caller == "free-bayes") {
+        gvcf_ch = freeBayesCaller(bqsr_ch, indexed_genome_ch.collect()).collect()
+    } else if (params.variant_caller == "bcftools-caller") {
+        gvcf_ch = bcftoolsCaller(bqsr_ch, indexed_genome_ch.collect()).collect()
     }
 
     // Now we map to create separate lists for sample IDs, VCF files, and index files
@@ -154,7 +180,11 @@ workflow {
         }
 
     // Combine GVCFs
-    combined_gvcf_ch = combineGVCFs(all_gvcf_ch, indexed_genome_ch.collect())
+    if (params.variant_caller == "haplotype-caller") {
+        combined_gvcf_ch = combineGVCFs(all_gvcf_ch, indexed_genome_ch.collect())
+    } else if (params.variant_caller == "bcftools-caller") {
+        combined_gvcf_ch = combineVCFs(all_gvcf_ch)
+    }
 
     // Run GenotypeGVCFs
     final_vcf_ch = genotypeGVCFs(combined_gvcf_ch, indexed_genome_ch.collect())
@@ -251,6 +281,27 @@ workflow FASTQC_only {
 
     if (params.fastqc) {
         FASTQC(read_pairs_ch)
+    }
+}
+
+workflow READ_TRIM_only {
+    // Set channel to gather read_pairs
+    read_pairs_ch = Channel
+        .fromPath(params.samplesheet)
+        .splitCsv(sep: '\t')
+        .map { row ->
+            if (row.size() == 4) {
+                tuple(row[0], [row[1], row[2]])
+            } else if (row.size() == 3) {
+                tuple(row[0], [row[1]])
+            } else {
+                error "Unexpected row format in samplesheet: $row"
+            }
+        }
+    read_pairs_ch.view()
+
+    if (params.readtrimming) {
+        readTrimming(read_pairs_ch)
     }
 }
 
